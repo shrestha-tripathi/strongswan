@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2011-2012 Sansar Choinyambuu
- * Copyright (C) 2012-2016 Andreas Steffen
+ * Copyright (C) 2012-2020 Andreas Steffen
  * HSR Hochschule fuer Technik Rapperswil
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -21,7 +21,6 @@
 #include <bio/bio_writer.h>
 #include <bio/bio_reader.h>
 
-#include <tpm_tss.h>
 #include <tpm_tss_trousers.h>
 
 #include <sys/types.h>
@@ -96,12 +95,17 @@ struct private_pts_t {
 	bool is_imc;
 
 	/**
-	 * Active TPM
+	 * IMC-PTS: own TPM / IMV-PTS: unused
 	 */
 	tpm_tss_t *tpm;
 
 	/**
-	 * Contains a TPM_CAP_VERSION_INFO struct
+	 * IMC-PTS: own TPM version / IMV-PTS: peer TPM version
+	 */
+	tpm_version_t tpm_version;
+
+	/**
+	 * Contains a TPM Version Info struct
 	 */
 	chunk_t tpm_version_info;
 
@@ -311,6 +315,12 @@ METHOD(pts_t, set_platform_id, void,
 	this->platform_id = pid;
 }
 
+METHOD(pts_t, get_tpm, tpm_tss_t*,
+	private_pts_t *this)
+{
+	return this->tpm;
+}
+
 METHOD(pts_t, get_tpm_version_info, bool,
 	private_pts_t *this, chunk_t *info)
 {
@@ -319,9 +329,47 @@ METHOD(pts_t, get_tpm_version_info, bool,
 	return info->len > 0;
 }
 
+#define TPM_VERSION_INFO_TAG_1_2	0x0030
+#define TPM_VERSION_INFO_TAG_2_0	0x0200
+#define TPM_VERSION_INFO_LABEL		"Version Information: TPM"
+
 METHOD(pts_t, set_tpm_version_info, void,
 	private_pts_t *this, chunk_t info)
 {
+	bio_reader_t *reader;
+	uint16_t tpm_version_info_tag;
+
+	reader = bio_reader_create(info);
+	reader->read_uint16(reader, &tpm_version_info_tag);
+
+	if (tpm_version_info_tag == TPM_VERSION_INFO_TAG_1_2)
+	{
+		this->tpm_version = TPM_VERSION_1_2;
+		DBG2(DBG_PTS, "%s 1.2", TPM_VERSION_INFO_LABEL);
+	}
+	else if (tpm_version_info_tag == TPM_VERSION_INFO_TAG_2_0)
+	{
+		uint32_t revision, year;
+		uint16_t reserved;
+		chunk_t vendor;
+
+		this->tpm_version = TPM_VERSION_2_0;
+
+		if (reader->read_uint16(reader, &reserved)  &&
+			reader->read_uint32(reader, &revision)  &&
+			reader->read_uint32(reader, &year)      &&
+			reader->read_data  (reader, 4, &vendor))
+		{
+			DBG2(DBG_PTS, "%s 2.0 %4.2f %u %4s", TPM_VERSION_INFO_LABEL,
+						  revision/100.0, year, vendor.ptr);
+		}
+		else
+		{
+			DBG2(DBG_PTS, "%s 2.0", TPM_VERSION_INFO_LABEL);
+		}
+	}
+	reader->destroy(reader);
+
 	this->tpm_version_info = chunk_clone(info);
 }
 
@@ -775,6 +823,10 @@ METHOD(pts_t, verify_quote_signature, bool,
 METHOD(pts_t, get_pcrs, pts_pcr_t*,
 	private_pts_t *this)
 {
+	if (!this->pcrs)
+	{
+		this->pcrs = pts_pcr_create(this->tpm_version);
+	}
 	return this->pcrs;
 }
 
@@ -798,14 +850,6 @@ METHOD(pts_t, destroy, void,
 pts_t *pts_create(bool is_imc)
 {
 	private_pts_t *this;
-	pts_pcr_t *pcrs;
-
-	pcrs = pts_pcr_create();
-	if (!pcrs)
-	{
-		DBG1(DBG_PTS, "shadow PCR set could not be created");
-		return NULL;
-	}
 
 	INIT(this,
 		.public = {
@@ -821,6 +865,7 @@ pts_t *pts_create(bool is_imc)
 			.calculate_secret = _calculate_secret,
 			.get_platform_id = _get_platform_id,
 			.set_platform_id = _set_platform_id,
+			.get_tpm = _get_tpm,
 			.get_tpm_version_info = _get_tpm_version_info,
 			.set_tpm_version_info = _set_tpm_version_info,
 			.get_aik = _get_aik,
@@ -840,7 +885,6 @@ pts_t *pts_create(bool is_imc)
 		.proto_caps = PTS_PROTO_CAPS_V,
 		.algorithm = PTS_MEAS_ALGO_SHA256,
 		.dh_hash_algorithm = PTS_MEAS_ALGO_SHA256,
-		.pcrs = pcrs,
 	);
 
 	if (is_imc)
@@ -849,12 +893,14 @@ pts_t *pts_create(bool is_imc)
 		if (this->tpm)
 		{
 			this->proto_caps |= PTS_PROTO_CAPS_T | PTS_PROTO_CAPS_D;
+			this->tpm_version = this->tpm->get_version(this->tpm);
 			load_aik(this);
 		}
 	}
 	else
 	{
 		this->proto_caps |= PTS_PROTO_CAPS_T | PTS_PROTO_CAPS_D;
+		this->tpm_version = TPM_VERSION_2_0;
 	}
 
 	return &this->public;
